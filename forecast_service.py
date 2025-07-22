@@ -180,8 +180,6 @@ def run_forecast_pipeline(zip_bytes, country, tech, zone, kpi, months=3):
 
 
 
-# forecast_service.py
-
 import zipfile
 import io
 import pandas as pd
@@ -189,119 +187,169 @@ from sklearn.linear_model import LinearRegression
 import numpy as np
 import plotly.graph_objects as go
 import json
+from datetime import datetime
 
 def extract_data_from_zip(zip_bytes):
-    """Extracts and labels each file in the ZIP with its corresponding month."""
+    """Robust extraction with proper date handling and error logging"""
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
         all_dfs = []
-        base_date = pd.Timestamp("2023-01-01")  # fallback base
-
-        for idx, file in enumerate(sorted(archive.namelist())):
-            if not file.endswith(".xlsx"):
-                continue
-
-            # Try to extract month-year from filename like Jan2024.xlsx
+        valid_files = sorted([f for f in archive.namelist() if f.endswith(".xlsx")])
+        
+        if not valid_files:
+            raise ValueError("No Excel files found in ZIP archive")
+        
+        for idx, file in enumerate(valid_files):
             try:
-                date = pd.to_datetime(file.split('.')[0], format="%b%Y")
-            except:
-                date = base_date + pd.DateOffset(months=idx)
-
-            try:
-                df = pd.read_excel(archive.open(file))
-                df['Month'] = date  # stamp all rows with this month's date
-                all_dfs.append(df)
+                # Extract date from filename (format: MonthYYYY.xlsx)
+                month_str, year_str = file.split('.')[0][:3], file.split('.')[0][3:]
+                date = datetime.strptime(f"{month_str} {year_str}", "%b %Y")
+                
+                with archive.open(file) as excel_file:
+                    df = pd.read_excel(excel_file)
+                    df['Month'] = date
+                    all_dfs.append(df)
+                    
             except Exception as e:
-                print(f"Skipping file {file}: {e}")
+                print(f"Error processing {file}: {str(e)}")
                 continue
 
-        if not all_dfs:
-            raise ValueError("No valid Excel files found in ZIP.")
         return pd.concat(all_dfs, ignore_index=True)
 
 def filter_and_prepare(df, country, tech, zone, kpi):
-    """Filters and aggregates time-series data for forecasting."""
-    filtered = df[
-        (df['Country'] == country) &
-        (df['Technology'] == tech) &
-        (df['Zone'] == zone) &
-        (df['KPI'] == kpi)
-    ]
-
+    """Improved filtering and time series preparation"""
+    # Validate input parameters
+    valid_params = {
+        'Country': country,
+        'Technology': tech,
+        'Zone': zone,
+        'KPI': kpi
+    }
+    
+    # Filter and validate
+    filtered = df.copy()
+    for col, value in valid_params.items():
+        if value:
+            filtered = filtered[filtered[col] == value]
+    
     if filtered.empty:
-        raise ValueError("No matching KPI records found.")
-
-    ts = filtered[['Month', 'Actual Value MAPS Networks']].copy()
-    ts = ts.groupby('Month').mean().reset_index()
-    ts.rename(columns={'Month': 'ds', 'Actual Value MAPS Networks': 'y'}, inplace=True)
-    ts = ts.sort_values('ds')
+        raise ValueError("No data matching the specified filters")
+    
+    # Prepare time series
+    ts = (
+        filtered.groupby('Month')
+        ['Actual Value MAPS Networks']
+        .mean()
+        .reset_index()
+        .rename(columns={'Month': 'ds', 'Actual Value MAPS Networks': 'y'})
+        .sort_values('ds')
+    )
+    
     return ts
 
 def forecast_with_lr(df, months=3):
-    """Forecasts future values using Linear Regression."""
+    """Enhanced forecasting with data validation"""
+    if len(df) < 2:
+        raise ValueError("At least 2 data points required for forecasting")
+    
+    # Create time index
+    df = df.copy()
     df['t'] = np.arange(len(df))
-    X = df[['t']]
-    y = df['y']
+    
+    # Train model
     model = LinearRegression()
-    model.fit(X, y)
-
-    # Forecast future points
-    future_t = np.arange(len(df), len(df) + months).reshape(-1, 1)
-    future_dates = pd.date_range(start=df['ds'].max() + pd.offsets.MonthBegin(), periods=months, freq='MS')
-    yhat = model.predict(future_t)
-
-    forecast_df = pd.DataFrame({
+    model.fit(df[['t']], df['y'])
+    
+    # Generate forecast dates
+    last_date = df['ds'].max()
+    future_dates = pd.date_range(
+        start=last_date + pd.offsets.MonthBegin(1),
+        periods=months,
+        freq='MS'
+    )
+    
+    # Predict values
+    future_t = np.arange(len(df), len(df) + months)
+    y_pred = model.predict(future_t.reshape(-1, 1))
+    
+    # Calculate confidence interval (std of residuals)
+    residuals = df['y'] - model.predict(df[['t']])
+    std_dev = residuals.std()
+    
+    return pd.DataFrame({
         'ds': future_dates,
-        'yhat': yhat,
-        'yhat_upper': yhat + 0.2,
-        'yhat_lower': yhat - 0.2
+        'yhat': y_pred,
+        'yhat_upper': y_pred + 1.96 * std_dev,
+        'yhat_lower': y_pred - 1.96 * std_dev
     })
 
-    return forecast_df
-
-def generate_plot(df, forecast_df):
-    """Generates Plotly graph JSON."""
+def generate_plot(actual_df, forecast_df):
+    """Create interactive plot with proper styling"""
     fig = go.Figure()
-
-    # Actual data
+    
+    # Actual values
     fig.add_trace(go.Scatter(
-        x=df['ds'], y=df['y'], name='Actual',
-        mode='lines+markers', line=dict(color='blue')
+        x=actual_df['ds'],
+        y=actual_df['y'],
+        name='Actual',
+        mode='lines+markers',
+        line=dict(color='#1f77b4', width=2),
+        marker=dict(size=6)
     ))
-
+    
     # Forecasted values
     fig.add_trace(go.Scatter(
-        x=forecast_df['ds'], y=forecast_df['yhat'], name='Forecast',
-        mode='lines+markers', line=dict(color='red')
+        x=forecast_df['ds'],
+        y=forecast_df['yhat'],
+        name='Forecast',
+        mode='lines+markers',
+        line=dict(color='#ff7f0e', width=2, dash='dash'),
+        marker=dict(size=6)
     ))
-
-    # Confidence intervals
+    
+    # Confidence interval
     fig.add_trace(go.Scatter(
-        x=forecast_df['ds'], y=forecast_df['yhat_upper'], name='Upper Bound',
-        mode='lines', line=dict(color='lightgray', dash='dot')
+        x=forecast_df['ds'].tolist() + forecast_df['ds'].tolist()[::-1],
+        y=forecast_df['yhat_upper'].tolist() + forecast_df['yhat_lower'].tolist()[::-1],
+        fill='toself',
+        fillcolor='rgba(255, 127, 14, 0.2)',
+        line=dict(color='rgba(255,255,255,0)'),
+        name='95% Confidence'
     ))
-    fig.add_trace(go.Scatter(
-        x=forecast_df['ds'], y=forecast_df['yhat_lower'], name='Lower Bound',
-        mode='lines', line=dict(color='lightgray', dash='dot')
-    ))
-
+    
     fig.update_layout(
         title='KPI Forecast',
-        xaxis_title='Month',
+        xaxis_title='Date',
         yaxis_title='Value',
-        template='plotly_white'
+        hovermode='x unified',
+        template='plotly_white',
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
     )
-
+    
     return fig.to_json()
 
 def run_forecast_pipeline(zip_bytes, country, tech, zone, kpi, months=3):
-    """Main entry for running the forecast pipeline."""
+    """Main pipeline with comprehensive error handling"""
     try:
+        # Step 1: Extract and process data
         df = extract_data_from_zip(zip_bytes)
+        
+        # Step 2: Filter and prepare time series
         ts_df = filter_and_prepare(df, country, tech, zone, kpi)
+        
+        # Step 3: Generate forecast
         forecast_df = forecast_with_lr(ts_df, months)
+        
+        # Step 4: Create visualization
         plot_json = generate_plot(ts_df, forecast_df)
+        
+        # Step 5: Prepare summary
+        forecast_df['ds'] = forecast_df['ds'].dt.strftime('%Y-%m-%d')
         summary = forecast_df.to_dict(orient='records')
+        
         return plot_json, summary, None
+        
     except Exception as e:
-        return None, None, str(e)
+        error_msg = f"Forecast failed: {str(e)}"
+        print(error_msg)
+        return None, None, error_msg
 
