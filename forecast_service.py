@@ -13,11 +13,18 @@ def extract_data_from_zip(zip_bytes):
         for file in archive.namelist():
             if file.endswith(".xlsx"):
                 try:
-                    date = pd.to_datetime(file.split(".")[0], format="%b%Y")
-                    df = pd.read_excel(archive.open(file))
+                    # Attempt to parse date from filename (e.g., Jan2023.xlsx)
+                    try:
+                        date = pd.to_datetime(file.split(".")[0], format="%b%Y")
+                    except Exception:
+                        # Fallback if filename is not in expected format
+                        date = pd.Timestamp.now()
+
+                    df = pd.read_excel(archive.open(file), engine='openpyxl')
                     df['Month'] = date
                     all_dfs.append(df)
-                except Exception:
+                except Exception as e:
+                    print(f"Skipping file {file} due to error: {e}")
                     continue
         if not all_dfs:
             raise ValueError("No valid Excel files found.")
